@@ -70,11 +70,9 @@ set(HIP_SOURCES
 # Add kernel library with HIP sources
 hip_add_library(fbgemm_kernels STATIC
     ${HIP_SOURCES}
-    src/gen_embedding_backward_split_unweighted_device_kernel_hip.cuh
     src/gen_embedding_optimizer_rowwise_adagrad_split_device_kernel_hip.cuh
     src/gen_embedding_backward_split_unweighted_device_kernel.cuh
     src/gen_embedding_backward_split_common_device_kernel.cuh
-    src/gen_embedding_optimizer_rowwise_adagrad_split_device_kernel.cuh
 )
 
 # Link with PyTorch
