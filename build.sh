@@ -31,11 +31,11 @@ cd build
 
 # Configure with CMake
 echo "Configuring with CMake..."
-cmake .. -DCMAKE_BUILD_TYPE=Release -DGPU_ARCH=${GPU_ARCH} -GNinja
+cmake .. -DCMAKE_BUILD_TYPE=Release -DGPU_ARCH=${GPU_ARCH}
 
 # Build the project
 echo "Building..."
-ninja
+make -j$(nproc)
 
 echo "Build completed successfully!"
 echo "Run './test_kernel' to test the kernel on AMD GPU (${GPU_ARCH})"
