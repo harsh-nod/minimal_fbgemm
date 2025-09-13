@@ -43,18 +43,18 @@ DEVICE_INLINE void compute_grad_sum_unweighted(
     // kUseVecBlocking == false
     const int32_t max_vecs =
         kUseVecBlocking ? num_vecs : kFixedMaxVecsPerThread;
-    
+
     // Basic gradient sum computation
     for (int32_t d = 0; d < D; d += VEC_WIDTH) {
         Vec4TAcc<cache_t> grad_vec;
         grad_vec.clear();
-        
+
         // Accumulate gradients
         for (int32_t i = sl_start; i < sl_end; ++i) {
             const int32_t info = sorted_infos[i];
             const int32_t t = info >> info_B_num_bits;
             const int32_t b = info & info_B_mask;
-            
+
             if (d + VEC_WIDTH <= D) {
                 grad_vec.acc.x += grad_output[b][D_offsets[t] + d];
                 if (VEC_WIDTH > 1) grad_vec.acc.y += grad_output[b][D_offsets[t] + d + 1];
@@ -62,7 +62,7 @@ DEVICE_INLINE void compute_grad_sum_unweighted(
                 if (VEC_WIDTH > 3) grad_vec.acc.w += grad_output[b][D_offsets[t] + d + 3];
             }
         }
-        
+
         grad_sum[d / VEC_WIDTH] = grad_vec;
     }
 }
