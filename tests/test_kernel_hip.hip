@@ -192,7 +192,7 @@ int main()
 
     std::cout << "Found " << deviceCount << " HIP devices" << std::endl;
 
-    HIP_CHECK(hipSetDevice(0));
+    HIP_CHECK(hipSetDevice(1));
     std::cout << "Using device: AMD Instinct MI300X" << std::endl;
     std::cout << "Compute capability: 11.0" << std::endl;
 
