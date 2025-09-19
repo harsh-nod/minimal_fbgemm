@@ -11,18 +11,21 @@
 #include <torch/torch.h>
 #include <iostream>
 #include <vector>
-#include <random>
 #include <chrono>
 #include <memory>
-#include <algorithm>
-#include <thread>
-#include <future>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <cmath>
 
 // Include ATen first
 #include <ATen/ATen.h>
 
-// Include the kernel
+// Include the kernels
 #include "../src/gen_embedding_backward_rowwise_adagrad_split_unweighted_kernel_cta.hip"
+#include "../src/gen_embedding_backward_split_indice_weights_codegen.hip"
+#include "../include/fbgemm_gpu/utils/fixed_divisor.cuh"
 
 // Helper function to check HIP errors
 #define HIP_CHECK(call)                                                  \
@@ -37,148 +40,418 @@
         }                                                                \
     } while (0)
 
-// Helper function for sequential hipMemcpyAsync operations
-template<typename T>
-void executeHipMemcpyAsync(std::vector<std::pair<void*, const void*>> memcpy_ops,
-                          std::vector<size_t> sizes,
-                          hipMemcpyKind kind)
-{
-    const size_t num_ops = memcpy_ops.size();
-
-    // Create a single stream for sequential async operations
-    hipStream_t stream;
-    HIP_CHECK(hipStreamCreate(&stream));
-
-    // Execute memory copies sequentially using async calls
-    for (size_t i = 0; i < num_ops; ++i) {
-        HIP_CHECK(hipMemcpyAsync(memcpy_ops[i].first, memcpy_ops[i].second, sizes[i], kind, stream));
-    }
-
-    // Synchronize the stream to ensure all operations complete
-    HIP_CHECK(hipStreamSynchronize(stream));
-
-    // Clean up the stream
-    HIP_CHECK(hipStreamDestroy(stream));
-}
-
-// Helper function to generate random data (multi-threaded version)
+// Helper function to print sample data
 template <typename T>
-void generateRandomData(std::vector<T> &data, T min_val = -1.0f, T max_val = 1.0f)
+void print_sample_data(const std::vector<T> &data, const std::string &name, int max_samples = 5)
 {
-    const size_t num_threads = std::min(static_cast<size_t>(std::thread::hardware_concurrency()), data.size());
-    const size_t chunk_size = data.size() / num_threads;
-
-    std::vector<std::future<void>> futures;
-
-    for (size_t thread_id = 0; thread_id < num_threads; ++thread_id) {
-        futures.emplace_back(std::async(std::launch::async, [&data, min_val, max_val, thread_id, chunk_size, num_threads]() {
-            // Each thread gets its own random number generator with different seed
-            std::random_device rd;
-            std::mt19937 gen(rd() + thread_id);
-            std::uniform_real_distribution<T> dis(min_val, max_val);
-
-            size_t start_idx = thread_id * chunk_size;
-            size_t end_idx = (thread_id == num_threads - 1) ? data.size() : (thread_id + 1) * chunk_size;
-
-            for (size_t i = start_idx; i < end_idx; ++i) {
-                data[i] = dis(gen);
-            }
-        }));
-    }
-
-    // Wait for all threads to complete
-    for (auto &future : futures) {
-        future.wait();
+    std::cout << "Sample captured " << name << " (first " << max_samples << " elements):" << std::endl;
+    for (int i = 0; i < std::min(max_samples, static_cast<int>(data.size())); ++i)
+    {
+        std::cout << "  " << name << "[" << i << "] = " << data[i] << std::endl;
     }
 }
 
-template <>
-void generateRandomData<int32_t>(std::vector<int32_t> &data, int32_t min_val, int32_t max_val)
+// Helper function to allocate device memory
+template <typename T>
+void allocate_device_memory(T **dev_ptr, size_t size)
 {
-    const size_t num_threads = std::min(static_cast<size_t>(std::thread::hardware_concurrency()), data.size());
-    const size_t chunk_size = data.size() / num_threads;
-
-    std::vector<std::future<void>> futures;
-
-    for (size_t thread_id = 0; thread_id < num_threads; ++thread_id) {
-        futures.emplace_back(std::async(std::launch::async, [&data, min_val, max_val, thread_id, chunk_size, num_threads]() {
-            std::random_device rd;
-            std::mt19937 gen(rd() + thread_id);
-            std::uniform_int_distribution<int32_t> dis(min_val, max_val);
-
-            size_t start_idx = thread_id * chunk_size;
-            size_t end_idx = (thread_id == num_threads - 1) ? data.size() : (thread_id + 1) * chunk_size;
-
-            for (size_t i = start_idx; i < end_idx; ++i) {
-                data[i] = dis(gen);
-            }
-        }));
-    }
-
-    for (auto &future : futures) {
-        future.wait();
-    }
+    HIP_CHECK(hipMalloc(dev_ptr, size * sizeof(T)));
 }
 
-template <>
-void generateRandomData<int64_t>(std::vector<int64_t> &data, int64_t min_val, int64_t max_val)
+// Helper function to copy data to device
+template <typename T>
+void copy_to_device(T *dev_ptr, const std::vector<T> &host_data)
 {
-    const size_t num_threads = std::min(static_cast<size_t>(std::thread::hardware_concurrency()), data.size());
-    const size_t chunk_size = data.size() / num_threads;
-
-    std::vector<std::future<void>> futures;
-
-    for (size_t thread_id = 0; thread_id < num_threads; ++thread_id) {
-        futures.emplace_back(std::async(std::launch::async, [&data, min_val, max_val, thread_id, chunk_size, num_threads]() {
-            std::random_device rd;
-            std::mt19937 gen(rd() + thread_id);
-            std::uniform_int_distribution<int64_t> dis(min_val, max_val);
-
-            size_t start_idx = thread_id * chunk_size;
-            size_t end_idx = (thread_id == num_threads - 1) ? data.size() : (thread_id + 1) * chunk_size;
-
-            for (size_t i = start_idx; i < end_idx; ++i) {
-                data[i] = dis(gen);
-            }
-        }));
-    }
-
-    for (auto &future : futures) {
-        future.wait();
-    }
+    HIP_CHECK(hipMemcpy(dev_ptr, host_data.data(), host_data.size() * sizeof(T), hipMemcpyHostToDevice));
 }
 
-template <>
-void generateRandomData<uint32_t>(std::vector<uint32_t> &data, uint32_t min_val, uint32_t max_val)
+// Helper function to copy data from device
+template <typename T>
+void copy_from_device(std::vector<T> &host_data, T *dev_ptr)
 {
-    const size_t num_threads = std::min(static_cast<size_t>(std::thread::hardware_concurrency()), data.size());
-    const size_t chunk_size = data.size() / num_threads;
+    HIP_CHECK(hipMemcpy(host_data.data(), dev_ptr, host_data.size() * sizeof(T), hipMemcpyDeviceToHost));
+}
 
-    std::vector<std::future<void>> futures;
+// Helper function to free device memory
+template <typename T>
+void free_device_memory(T *dev_ptr)
+{
+    HIP_CHECK(hipFree(dev_ptr));
+}
 
-    for (size_t thread_id = 0; thread_id < num_threads; ++thread_id) {
-        futures.emplace_back(std::async(std::launch::async, [&data, min_val, max_val, thread_id, chunk_size, num_threads]() {
-            std::random_device rd;
-            std::mt19937 gen(rd() + thread_id);
-            std::uniform_int_distribution<uint32_t> dis(min_val, max_val);
+// Helper function to create 1D tensor accessor
+template <typename T, int N>
+auto create_1d_accessor(T *dev_ptr, int32_t size)
+{
+    int32_t sizes[N] = {size};
+    int32_t strides[N] = {1};
+    return at::PackedTensorAccessor32<T, N, at::RestrictPtrTraits>(dev_ptr, sizes, strides);
+}
 
-            size_t start_idx = thread_id * chunk_size;
-            size_t end_idx = (thread_id == num_threads - 1) ? data.size() : (thread_id + 1) * chunk_size;
+// Helper function to create 2D tensor accessor
+template <typename T, int N>
+auto create_2d_accessor(T *dev_ptr, int32_t dim0, int32_t dim1)
+{
+    int32_t sizes[N] = {dim0, dim1};
+    int32_t strides[N] = {dim1, 1};
+    return at::PackedTensorAccessor32<T, N, at::RestrictPtrTraits>(dev_ptr, sizes, strides);
+}
 
-            for (size_t i = start_idx; i < end_idx; ++i) {
-                data[i] = dis(gen);
-            }
-        }));
+// Helper function to create 1D tensor accessor with int64_t
+template <typename T, int N>
+auto create_1d_accessor64(T *dev_ptr, int64_t size)
+{
+    int64_t sizes[N] = {size};
+    int64_t strides[N] = {1};
+    return at::PackedTensorAccessor64<T, N, at::RestrictPtrTraits>(dev_ptr, sizes, strides);
+}
+
+// Helper function to create 2D tensor accessor with int64_t
+template <typename T, int N>
+auto create_2d_accessor64(T *dev_ptr, int64_t dim0, int64_t dim1)
+{
+    int64_t sizes[N] = {dim0, dim1};
+    int64_t strides[N] = {dim1, 1};
+    return at::PackedTensorAccessor64<T, N, at::RestrictPtrTraits>(dev_ptr, sizes, strides);
+}
+
+// Structure to hold captured data
+struct CapturedData
+{
+    std::vector<float> grad_output;
+    std::vector<float> dev_weights;
+    std::vector<float> uvm_weights;
+    std::vector<float> lxu_cache_weights;
+    std::vector<int32_t> weights_placements;
+    std::vector<int64_t> weights_offsets;
+    std::vector<int32_t> D_offsets;
+    int64_t max_D;
+    std::vector<int64_t> indices;
+    std::vector<int64_t> offsets;
+    std::vector<int32_t> lxu_cache_locations;
+    std::vector<int32_t> feature_requires_grad;
+
+    int32_t T;       // number of tables
+    int32_t B;       // batch size
+    int32_t total_D; // total embedding dimension
+};
+
+// Helper function to read all captured data
+CapturedData read_captured_data(const std::string &capture_dir)
+{
+    CapturedData data;
+
+    data.grad_output = read_tensor_from_file<float>(capture_dir + "/grad_output.bin");
+    data.dev_weights = read_tensor_from_file<float>(capture_dir + "/dev_weights.bin");
+    data.uvm_weights = read_tensor_from_file<float>(capture_dir + "/uvm_weights.bin");
+    data.lxu_cache_weights = read_tensor_from_file<float>(capture_dir + "/lxu_cache_weights.bin");
+    data.weights_placements = read_tensor_from_file<int32_t>(capture_dir + "/weights_placements.bin");
+    data.weights_offsets = read_tensor_from_file<int64_t>(capture_dir + "/weights_offsets.bin");
+    data.D_offsets = read_tensor_from_file<int32_t>(capture_dir + "/D_offsets.bin");
+    data.max_D = read_scalar_from_file<int64_t>(capture_dir + "/max_D.bin");
+    data.indices = read_tensor_from_file<int64_t>(capture_dir + "/indices.bin");
+    data.offsets = read_tensor_from_file<int64_t>(capture_dir + "/offsets.bin");
+    data.lxu_cache_locations = read_tensor_from_file<int32_t>(capture_dir + "/lxu_cache_locations.bin");
+    data.feature_requires_grad = read_tensor_from_file<int32_t>(capture_dir + "/feature_requires_grad.bin");
+
+    // Calculate dimensions
+    data.T = data.D_offsets.size() - 1;
+    data.B = data.offsets.size() - 1;
+    data.total_D = 0;
+    for (int i = 0; i < data.T; ++i)
+    {
+        data.total_D += data.D_offsets[i + 1] - data.D_offsets[i];
     }
 
-    for (auto &future : futures) {
-        future.wait();
+    return data;
+}
+
+// Helper function to verify captured data
+bool verify_captured_data(const CapturedData &data)
+{
+    if (data.grad_output.empty() || data.dev_weights.empty())
+    {
+        std::cerr << "Failed to read captured data!" << std::endl;
+        return false;
+    }
+
+    if (data.grad_output.size() != data.B * data.total_D)
+    {
+        std::cerr << "Error: grad_output size mismatch. Expected " << data.B * data.total_D
+                  << ", got " << data.grad_output.size() << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+// Helper function to print captured data info
+void print_captured_data_info(const CapturedData &data)
+{
+    std::cout << "Captured data verification:" << std::endl;
+    std::cout << "  grad_output size: " << data.grad_output.size() << std::endl;
+    std::cout << "  dev_weights size: " << data.dev_weights.size() << std::endl;
+    std::cout << "  uvm_weights size: " << data.uvm_weights.size() << std::endl;
+    std::cout << "  lxu_cache_weights size: " << data.lxu_cache_weights.size() << std::endl;
+    std::cout << "  weights_placements size: " << data.weights_placements.size() << std::endl;
+    std::cout << "  weights_offsets size: " << data.weights_offsets.size() << std::endl;
+    std::cout << "  D_offsets size: " << data.D_offsets.size() << std::endl;
+    std::cout << "  max_D: " << data.max_D << std::endl;
+    std::cout << "  indices size: " << data.indices.size() << std::endl;
+    std::cout << "  offsets size: " << data.offsets.size() << std::endl;
+    std::cout << "  lxu_cache_locations size: " << data.lxu_cache_locations.size() << std::endl;
+    std::cout << "  feature_requires_grad size: " << data.feature_requires_grad.size() << std::endl;
+
+    std::cout << "Calculated dimensions from captured data:" << std::endl;
+    std::cout << "  B (batch size): " << data.B << std::endl;
+    std::cout << "  T (number of tables): " << data.T << std::endl;
+    std::cout << "  total_D: " << data.total_D << std::endl;
+}
+
+// Helper function to print sample data
+void print_sample_captured_data(const CapturedData &data)
+{
+    print_sample_data(data.grad_output, "grad_output");
+    print_sample_data(data.indices, "indices");
+    print_sample_data(data.offsets, "offsets");
+}
+
+// Structure to hold device pointers
+struct DevicePointers
+{
+    float *grad_output_dev;
+    float *dev_weights_dev;
+    float *uvm_weights_dev;
+    float *lxu_cache_weights_dev;
+    int32_t *weights_placements_dev;
+    int64_t *weights_offsets_dev;
+    int32_t *D_offsets_dev;
+    int64_t *indices_dev;
+    int64_t *offsets_dev;
+    int32_t *lxu_cache_locations_dev;
+    int32_t *feature_requires_grad_dev;
+    float *grad_indice_weights_dev;
+};
+
+// Helper function to allocate all device memory
+DevicePointers allocate_device_memory(const CapturedData &data)
+{
+    DevicePointers ptrs;
+
+    allocate_device_memory(&ptrs.grad_output_dev, data.grad_output.size());
+    allocate_device_memory(&ptrs.dev_weights_dev, data.dev_weights.size());
+    allocate_device_memory(&ptrs.uvm_weights_dev, data.uvm_weights.size());
+    allocate_device_memory(&ptrs.lxu_cache_weights_dev, data.lxu_cache_weights.size());
+    allocate_device_memory(&ptrs.weights_placements_dev, data.weights_placements.size());
+    allocate_device_memory(&ptrs.weights_offsets_dev, data.weights_offsets.size());
+    allocate_device_memory(&ptrs.D_offsets_dev, data.D_offsets.size());
+    allocate_device_memory(&ptrs.indices_dev, data.indices.size());
+    allocate_device_memory(&ptrs.offsets_dev, data.offsets.size());
+    allocate_device_memory(&ptrs.lxu_cache_locations_dev, data.lxu_cache_locations.size());
+    allocate_device_memory(&ptrs.feature_requires_grad_dev, data.feature_requires_grad.size());
+    allocate_device_memory(&ptrs.grad_indice_weights_dev, data.indices.size());
+
+    return ptrs;
+}
+
+// Helper function to copy all data to device
+void copy_all_data_to_device(const CapturedData &data, const DevicePointers &ptrs)
+{
+    copy_to_device(ptrs.grad_output_dev, data.grad_output);
+    copy_to_device(ptrs.dev_weights_dev, data.dev_weights);
+    copy_to_device(ptrs.uvm_weights_dev, data.uvm_weights);
+    copy_to_device(ptrs.lxu_cache_weights_dev, data.lxu_cache_weights);
+    copy_to_device(ptrs.weights_placements_dev, data.weights_placements);
+    copy_to_device(ptrs.weights_offsets_dev, data.weights_offsets);
+    copy_to_device(ptrs.D_offsets_dev, data.D_offsets);
+    copy_to_device(ptrs.indices_dev, data.indices);
+    copy_to_device(ptrs.offsets_dev, data.offsets);
+    copy_to_device(ptrs.lxu_cache_locations_dev, data.lxu_cache_locations);
+    copy_to_device(ptrs.feature_requires_grad_dev, data.feature_requires_grad);
+}
+
+// Helper function to free all device memory
+void free_all_device_memory(const DevicePointers &ptrs)
+{
+    free_device_memory(ptrs.grad_output_dev);
+    free_device_memory(ptrs.dev_weights_dev);
+    free_device_memory(ptrs.uvm_weights_dev);
+    free_device_memory(ptrs.lxu_cache_weights_dev);
+    free_device_memory(ptrs.weights_placements_dev);
+    free_device_memory(ptrs.weights_offsets_dev);
+    free_device_memory(ptrs.D_offsets_dev);
+    free_device_memory(ptrs.indices_dev);
+    free_device_memory(ptrs.offsets_dev);
+    free_device_memory(ptrs.lxu_cache_locations_dev);
+    free_device_memory(ptrs.feature_requires_grad_dev);
+    free_device_memory(ptrs.grad_indice_weights_dev);
+}
+
+// Helper function to create all tensor accessors
+auto create_all_tensor_accessors(const CapturedData &data, const DevicePointers &ptrs)
+{
+    struct TensorAccessors
+    {
+        decltype(create_2d_accessor64<float, 2>(nullptr, 0, 0)) grad_output_acc;
+        decltype(create_1d_accessor64<float, 1>(nullptr, 0)) dev_weights_acc;
+        decltype(create_1d_accessor64<float, 1>(nullptr, 0)) uvm_weights_acc;
+        decltype(create_2d_accessor64<float, 2>(nullptr, 0, 0)) lxu_cache_weights_acc;
+        decltype(create_1d_accessor<int32_t, 1>(nullptr, 0)) weights_placements_acc;
+        decltype(create_1d_accessor<int64_t, 1>(nullptr, 0)) weights_offsets_acc;
+        decltype(create_1d_accessor<int32_t, 1>(nullptr, 0)) D_offsets_acc;
+        decltype(create_1d_accessor<int64_t, 1>(nullptr, 0)) indices_acc;
+        decltype(create_1d_accessor<int64_t, 1>(nullptr, 0)) offsets_acc;
+        decltype(create_1d_accessor<int32_t, 1>(nullptr, 0)) lxu_cache_locations_acc;
+        decltype(create_1d_accessor<int32_t, 1>(nullptr, 0)) feature_requires_grad_acc;
+        decltype(create_1d_accessor<float, 1>(nullptr, 0)) grad_indice_weights_acc;
+    };
+
+    TensorAccessors accs;
+
+    accs.grad_output_acc = create_2d_accessor64<float, 2>(ptrs.grad_output_dev, data.B, data.total_D);
+    accs.dev_weights_acc = create_1d_accessor64<float, 1>(ptrs.dev_weights_dev, data.dev_weights.size());
+    accs.uvm_weights_acc = create_1d_accessor64<float, 1>(ptrs.uvm_weights_dev, data.uvm_weights.size());
+    accs.lxu_cache_weights_acc = create_2d_accessor64<float, 2>(ptrs.lxu_cache_weights_dev,
+                                                                data.lxu_cache_weights.size() / data.max_D,
+                                                                data.max_D);
+    accs.weights_placements_acc = create_1d_accessor<int32_t, 1>(ptrs.weights_placements_dev, data.T);
+    accs.weights_offsets_acc = create_1d_accessor<int64_t, 1>(ptrs.weights_offsets_dev, data.T);
+    accs.D_offsets_acc = create_1d_accessor<int32_t, 1>(ptrs.D_offsets_dev, data.T + 1);
+    accs.indices_acc = create_1d_accessor<int64_t, 1>(ptrs.indices_dev, data.indices.size());
+    accs.offsets_acc = create_1d_accessor<int64_t, 1>(ptrs.offsets_dev, data.offsets.size());
+    accs.lxu_cache_locations_acc = create_1d_accessor<int32_t, 1>(ptrs.lxu_cache_locations_dev, data.lxu_cache_locations.size());
+    accs.feature_requires_grad_acc = create_1d_accessor<int32_t, 1>(ptrs.feature_requires_grad_dev, data.T);
+    accs.grad_indice_weights_acc = create_1d_accessor<float, 1>(ptrs.grad_indice_weights_dev, data.indices.size());
+
+    return accs;
+}
+
+// Helper function to read tensor data from files
+template <typename T>
+std::vector<T> read_tensor_from_file(const std::string &filename)
+{
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open())
+    {
+        std::cerr << "Failed to open file: " << filename << std::endl;
+        return {};
+    }
+
+    // Read tensor metadata
+    c10::ScalarType dtype;
+    c10::DeviceType device_type;
+    int32_t device_index;
+
+    file.read(reinterpret_cast<char *>(&dtype), sizeof(dtype));
+    file.read(reinterpret_cast<char *>(&device_type), sizeof(device_type));
+    file.read(reinterpret_cast<char *>(&device_index), sizeof(device_index));
+
+    // Read tensor dimensions
+    int64_t num_dims;
+    file.read(reinterpret_cast<char *>(&num_dims), sizeof(num_dims));
+
+    std::vector<int64_t> dims(num_dims);
+    for (int64_t i = 0; i < num_dims; ++i)
+    {
+        file.read(reinterpret_cast<char *>(&dims[i]), sizeof(dims[i]));
+    }
+
+    // Calculate total elements
+    int64_t total_elements = 1;
+    for (int64_t dim : dims)
+    {
+        total_elements *= dim;
+    }
+
+    // Read tensor data
+    std::vector<T> data(total_elements);
+    file.read(reinterpret_cast<char *>(data.data()), total_elements * sizeof(T));
+
+    file.close();
+
+    std::cout << "Read tensor from " << filename << ": dtype=" << dtype
+              << ", device=" << device_type << ":" << device_index
+              << ", dims=[";
+    for (int64_t i = 0; i < num_dims; ++i)
+    {
+        std::cout << dims[i];
+        if (i < num_dims - 1)
+            std::cout << ", ";
+    }
+    std::cout << "], elements=" << total_elements << std::endl;
+
+    return data;
+}
+
+// Helper function to read scalar values from files
+template <typename T>
+T read_scalar_from_file(const std::string &filename)
+{
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open())
+    {
+        std::cerr << "Failed to open file: " << filename << std::endl;
+        return T{};
+    }
+
+    T value;
+    file.read(reinterpret_cast<char *>(&value), sizeof(value));
+    file.close();
+
+    std::cout << "Read scalar from " << filename << ": " << value << std::endl;
+    return value;
+}
+
+// Helper function to find the most recent capture directory
+std::string find_latest_capture_directory()
+{
+    std::string current_dir = ".";
+    std::string latest_dir;
+    auto latest_time = std::filesystem::file_time_type::min();
+
+    for (const auto &entry : std::filesystem::directory_iterator(current_dir))
+    {
+        if (entry.is_directory())
+        {
+            std::string dirname = entry.path().filename().string();
+            if (dirname.find("embedding_grad_indice_weights_capture_") == 0)
+            {
+                auto dir_time = entry.last_write_time();
+                if (dir_time > latest_time)
+                {
+                    latest_time = dir_time;
+                    latest_dir = dirname;
+                }
+            }
+        }
+    }
+
+    if (latest_dir.empty())
+    {
+        std::cerr << "No capture directory found!" << std::endl;
+        return "";
+    }
+
+    std::cout << "Found latest capture directory: " << latest_dir << std::endl;
+    return latest_dir;
+}
+
+// Helper function to save results to file
+void save_results_to_file(const std::string &capture_dir, const std::vector<float> &results)
+{
+    std::string results_file = capture_dir + "/grad_indice_weights_results.bin";
+    std::ofstream results_out(results_file, std::ios::binary);
+    if (results_out.is_open())
+    {
+        results_out.write(reinterpret_cast<const char *>(results.data()), results.size() * sizeof(float));
+        results_out.close();
+        std::cout << "Results saved to: " << results_file << std::endl;
     }
 }
 
 int main()
 {
-    std::cout << "Testing split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_cta_per_row_1 on AMD GPU" << std::endl;
+    std::cout << "Testing grad indice weights kernel with captured data on AMD GPU" << std::endl;
 
     // Use direct HIP API to check GPU availability
     int deviceCount;
@@ -196,510 +469,89 @@ int main()
     std::cout << "Using device: AMD Instinct MI300X" << std::endl;
     std::cout << "Compute capability: 11.0" << std::endl;
 
-    // Test parameters
-    const int32_t B = 229376;         // batch size
-    const int32_t T = 21;             // number of tables
-    const int32_t num_indices = 1000; // number of indices
-    const int32_t cache_size = 100;   // cache size
+    // Test the grad indice weights kernel
+    std::cout << "\n=== Testing Grad Indice Weights Kernel ===" << std::endl;
 
-    // Embedding dimensions for each table
-    const std::vector<int32_t> Ds = {64, 12, 320, 160, 4, 160, 320, 320, 64, 160, 320, 12, 64, 12, 160, 320, 320, 320, 160, 12, 4};
-
-    // Embedding sizes for each table
-    const std::vector<int64_t> Es = {13200000, 363, 590355, 321271, 2, 207087, 3209510, 305789, 13200000, 3210880, 1669610, 191, 13200000, 611, 3212700, 1212200, 305789, 688670, 3057890, 741, 2};
-
-    // Length parameters (mu and sigma)
-    const std::vector<int32_t> Ls_mu = {1, 1, 4, 188, 1, 17, 32, 14, 1, 12, 1, 1, 1, 1, 8, 1, 1, 24, 116, 1, 1};
-    const std::vector<int32_t> Ls_sigma = {0, 0, 0, 37, 0, 3, 6, 2, 0, 2, 0, 0, 0, 0, 1, 0, 0, 4, 23, 0, 0};
-
-    std::cout << "Test parameters:" << std::endl;
-    std::cout << "  Batch size (B): " << B << std::endl;
-    std::cout << "  Number of tables (T): " << T << std::endl;
-    std::cout << "  Number of indices: " << num_indices << std::endl;
-    std::cout << "  Cache size: " << cache_size << std::endl;
-    std::cout << "  Embedding dimensions (Ds): [";
-    for (int i = 0; i < T; ++i)
+    // Check if capture directory exists
+    std::string capture_dir = find_latest_capture_directory();
+    if (capture_dir.empty())
     {
-        std::cout << Ds[i];
-        if (i < T - 1)
-            std::cout << ", ";
-    }
-    std::cout << "]" << std::endl;
-    std::cout << "  Embedding sizes (Es): [";
-    for (int i = 0; i < T; ++i)
-    {
-        std::cout << Es[i];
-        if (i < T - 1)
-            std::cout << ", ";
-    }
-    std::cout << "]" << std::endl;
-
-    // Calculate total embedding dimension
-    int32_t total_D = 0;
-    for (int i = 0; i < T; ++i)
-    {
-        total_D += Ds[i];
+        std::cerr << "No capture directory found! Please run with CAPTURE_ENABLED=1 first to capture embedding inputs." << std::endl;
+        return 1;
     }
 
-    // Allocate host memory
-    std::vector<float> grad_output_host(B * total_D);
+    std::cout << "Found capture directory: " << capture_dir << std::endl;
+    std::cout << "Reading captured data and running grad indice weights kernel..." << std::endl;
 
-    // Calculate total weights size
-    int64_t total_weights_size = 0;
-    for (int i = 0; i < T; ++i)
+    // Read and verify captured data
+    CapturedData data = read_captured_data(capture_dir);
+    if (!verify_captured_data(data))
     {
-        total_weights_size += Es[i] * Ds[i];
+        return 1;
     }
 
-    std::vector<float> dev_weights_host(total_weights_size);
-    std::vector<float> uvm_weights_host(total_weights_size);
+    std::cout << "Successfully read captured data. Running grad indice weights kernel with captured inputs..." << std::endl;
 
-    // Calculate max cache size needed
-    int32_t max_D = *std::max_element(Ds.begin(), Ds.end());
-    std::vector<float> lxu_cache_weights_host(cache_size * max_D);
-
-    std::vector<int32_t> weights_placements_host(T);
-    std::vector<int64_t> weights_offsets_host(T);
-    std::vector<int32_t> D_offsets_host(T);
-    std::vector<int64_t> hash_size_cumsum_host(T);
-    std::vector<int32_t> sorted_linear_indices_run_host(num_indices);
-    std::vector<int32_t> sorted_linear_indices_cumulative_run_lengths_host(num_indices);
-    std::vector<int32_t> long_run_ids_host(num_indices);
-    std::vector<int32_t> num_long_run_ids_host(1);
-    std::vector<int32_t> sorted_infos_host(num_indices);
-    std::vector<int32_t> sorted_lxu_cache_locations_host(num_indices);
-    std::vector<int32_t> table_unique_indices_offsets_host(T);
-    std::vector<int32_t> long_run_id_to_really_long_run_ids_host(num_indices);
-    std::vector<float> temp_grad_accum_host(B * total_D);
-    std::vector<int32_t> grad_accum_counter_host(1);
-    std::vector<float> momentum1_dev_host(total_weights_size);
-    std::vector<float> momentum1_uvm_host(total_weights_size);
-    std::vector<int32_t> momentum1_placements_host(T);
-    std::vector<int64_t> momentum1_offsets_host(T);
-
-    // Generate random data
-    std::cout << "Generating random test data..." << std::endl;
-    auto random_start = std::chrono::high_resolution_clock::now();
-    generateRandomData(grad_output_host, -0.1f, 0.1f);
-    generateRandomData(dev_weights_host, -0.5f, 0.5f);
-    generateRandomData(uvm_weights_host, -0.5f, 0.5f);
-    generateRandomData(lxu_cache_weights_host, -0.5f, 0.5f);
-
-    generateRandomData(weights_placements_host, 0, 2); // PlacementType values
-    generateRandomData(weights_offsets_host, 0L, 1000L);
-    generateRandomData(D_offsets_host, 0, total_D);
-    generateRandomData(hash_size_cumsum_host, 0L, 1000L);
-    generateRandomData(sorted_linear_indices_run_host, 0, num_indices - 1);
-    generateRandomData(sorted_linear_indices_cumulative_run_lengths_host, 0, num_indices);
-    generateRandomData(long_run_ids_host, 0, num_indices - 1);
-    generateRandomData(num_long_run_ids_host, 0, num_indices);
-    generateRandomData(sorted_infos_host, 0, (1 << 20) - 1);                 // Large range for info
-    generateRandomData(sorted_lxu_cache_locations_host, -1, cache_size - 1); // -1 for missing
-    generateRandomData(table_unique_indices_offsets_host, 0, num_indices);
-    generateRandomData(long_run_id_to_really_long_run_ids_host, 0, num_indices - 1);
-    generateRandomData(temp_grad_accum_host, -0.1f, 0.1f);
-    generateRandomData(grad_accum_counter_host, 0, 100);
-    generateRandomData(momentum1_dev_host, 0.0f, 1.0f);
-    generateRandomData(momentum1_uvm_host, 0.0f, 1.0f);
-    generateRandomData(momentum1_placements_host, 0, 2);
-    generateRandomData(momentum1_offsets_host, 0L, 1000L);
-
-    auto random_end = std::chrono::high_resolution_clock::now();
-    auto random_duration = std::chrono::duration_cast<std::chrono::microseconds>(random_end - random_start);
-    std::cout << "Multi-threaded random data generation completed in: " << random_duration.count() << " microseconds" << std::endl;
-
-    // Set up some meaningful values
-    int64_t weights_offset = 0;
-    int32_t D_offset = 0;
-    int64_t hash_size_offset = 0;
-    int64_t momentum_offset = 0;
-
-    for (int i = 0; i < T; ++i)
-    {
-        weights_offsets_host[i] = weights_offset;
-        D_offsets_host[i] = D_offset;
-        hash_size_cumsum_host[i] = hash_size_offset;
-        momentum1_offsets_host[i] = momentum_offset;
-
-        weights_offset += Es[i] * Ds[i];
-        D_offset += Ds[i];
-        hash_size_offset += Es[i];
-        momentum_offset += Es[i] * Ds[i];
-    }
-
-    num_long_run_ids_host[0] = std::min(10, num_indices);
-    grad_accum_counter_host[0] = 0;
+    // Print captured data information
+    print_captured_data_info(data);
+    print_sample_captured_data(data);
 
     // Allocate device memory
-    std::cout << "Allocating device memory..." << std::endl;
+    DevicePointers ptrs = allocate_device_memory(data);
 
-    float *grad_output_dev;
-    float *dev_weights_dev;
-    float *uvm_weights_dev;
-    float *lxu_cache_weights_dev;
-    int32_t *weights_placements_dev;
-    int64_t *weights_offsets_dev;
-    int32_t *D_offsets_dev;
-    int64_t *hash_size_cumsum_dev;
-    int32_t *sorted_linear_indices_run_dev;
-    int32_t *sorted_linear_indices_cumulative_run_lengths_dev;
-    int32_t *long_run_ids_dev;
-    int32_t *num_long_run_ids_dev;
-    int32_t *sorted_infos_dev;
-    int32_t *sorted_lxu_cache_locations_dev;
-    int32_t *table_unique_indices_offsets_dev;
-    int32_t *long_run_id_to_really_long_run_ids_dev;
-    float *temp_grad_accum_dev;
-    int32_t *grad_accum_counter_dev;
-    float *momentum1_dev_dev;
-    float *momentum1_uvm_dev;
-    int32_t *momentum1_placements_dev;
-    int64_t *momentum1_offsets_dev;
-
-    HIP_CHECK(hipMalloc(&grad_output_dev, grad_output_host.size() * sizeof(float)));
-    HIP_CHECK(hipMalloc(&dev_weights_dev, dev_weights_host.size() * sizeof(float)));
-    HIP_CHECK(hipMalloc(&uvm_weights_dev, uvm_weights_host.size() * sizeof(float)));
-    HIP_CHECK(hipMalloc(&lxu_cache_weights_dev, lxu_cache_weights_host.size() * sizeof(float)));
-    HIP_CHECK(hipMalloc(&weights_placements_dev, weights_placements_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&weights_offsets_dev, weights_offsets_host.size() * sizeof(int64_t)));
-    HIP_CHECK(hipMalloc(&D_offsets_dev, D_offsets_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&hash_size_cumsum_dev, hash_size_cumsum_host.size() * sizeof(int64_t)));
-    HIP_CHECK(hipMalloc(&sorted_linear_indices_run_dev, sorted_linear_indices_run_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&sorted_linear_indices_cumulative_run_lengths_dev, sorted_linear_indices_cumulative_run_lengths_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&long_run_ids_dev, long_run_ids_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&num_long_run_ids_dev, num_long_run_ids_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&sorted_infos_dev, sorted_infos_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&sorted_lxu_cache_locations_dev, sorted_lxu_cache_locations_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&table_unique_indices_offsets_dev, table_unique_indices_offsets_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&long_run_id_to_really_long_run_ids_dev, long_run_id_to_really_long_run_ids_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&temp_grad_accum_dev, temp_grad_accum_host.size() * sizeof(float)));
-    HIP_CHECK(hipMalloc(&grad_accum_counter_dev, grad_accum_counter_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&momentum1_dev_dev, momentum1_dev_host.size() * sizeof(float)));
-    HIP_CHECK(hipMalloc(&momentum1_uvm_dev, momentum1_uvm_host.size() * sizeof(float)));
-    HIP_CHECK(hipMalloc(&momentum1_placements_dev, momentum1_placements_host.size() * sizeof(int32_t)));
-    HIP_CHECK(hipMalloc(&momentum1_offsets_dev, momentum1_offsets_host.size() * sizeof(int64_t)));
-
-    // Copy data to device (parallel version)
-    std::cout << "Copying data to device..." << std::endl;
-
-    auto memcpy_start = std::chrono::high_resolution_clock::now();
-
-    std::vector<std::pair<void*, const void*>> memcpy_ops;
-    std::vector<size_t> sizes;
-
-    // Prepare all memcpy operations
-    memcpy_ops.emplace_back(grad_output_dev, grad_output_host.data());
-    sizes.push_back(grad_output_host.size() * sizeof(float));
-
-    memcpy_ops.emplace_back(dev_weights_dev, dev_weights_host.data());
-    sizes.push_back(dev_weights_host.size() * sizeof(float));
-
-    memcpy_ops.emplace_back(uvm_weights_dev, uvm_weights_host.data());
-    sizes.push_back(uvm_weights_host.size() * sizeof(float));
-
-    memcpy_ops.emplace_back(lxu_cache_weights_dev, lxu_cache_weights_host.data());
-    sizes.push_back(lxu_cache_weights_host.size() * sizeof(float));
-
-    memcpy_ops.emplace_back(weights_placements_dev, weights_placements_host.data());
-    sizes.push_back(weights_placements_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(weights_offsets_dev, weights_offsets_host.data());
-    sizes.push_back(weights_offsets_host.size() * sizeof(int64_t));
-
-    memcpy_ops.emplace_back(D_offsets_dev, D_offsets_host.data());
-    sizes.push_back(D_offsets_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(hash_size_cumsum_dev, hash_size_cumsum_host.data());
-    sizes.push_back(hash_size_cumsum_host.size() * sizeof(int64_t));
-
-    memcpy_ops.emplace_back(sorted_linear_indices_run_dev, sorted_linear_indices_run_host.data());
-    sizes.push_back(sorted_linear_indices_run_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(sorted_linear_indices_cumulative_run_lengths_dev, sorted_linear_indices_cumulative_run_lengths_host.data());
-    sizes.push_back(sorted_linear_indices_cumulative_run_lengths_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(long_run_ids_dev, long_run_ids_host.data());
-    sizes.push_back(long_run_ids_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(num_long_run_ids_dev, num_long_run_ids_host.data());
-    sizes.push_back(num_long_run_ids_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(sorted_infos_dev, sorted_infos_host.data());
-    sizes.push_back(sorted_infos_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(sorted_lxu_cache_locations_dev, sorted_lxu_cache_locations_host.data());
-    sizes.push_back(sorted_lxu_cache_locations_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(table_unique_indices_offsets_dev, table_unique_indices_offsets_host.data());
-    sizes.push_back(table_unique_indices_offsets_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(long_run_id_to_really_long_run_ids_dev, long_run_id_to_really_long_run_ids_host.data());
-    sizes.push_back(long_run_id_to_really_long_run_ids_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(temp_grad_accum_dev, temp_grad_accum_host.data());
-    sizes.push_back(temp_grad_accum_host.size() * sizeof(float));
-
-    memcpy_ops.emplace_back(grad_accum_counter_dev, grad_accum_counter_host.data());
-    sizes.push_back(grad_accum_counter_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(momentum1_dev_dev, momentum1_dev_host.data());
-    sizes.push_back(momentum1_dev_host.size() * sizeof(float));
-
-    memcpy_ops.emplace_back(momentum1_uvm_dev, momentum1_uvm_host.data());
-    sizes.push_back(momentum1_uvm_host.size() * sizeof(float));
-
-    memcpy_ops.emplace_back(momentum1_placements_dev, momentum1_placements_host.data());
-    sizes.push_back(momentum1_placements_host.size() * sizeof(int32_t));
-
-    memcpy_ops.emplace_back(momentum1_offsets_dev, momentum1_offsets_host.data());
-    sizes.push_back(momentum1_offsets_host.size() * sizeof(int64_t));
-
-    // Execute all memcpy operations sequentially using async calls
-    executeHipMemcpyAsync<int>(memcpy_ops, sizes, hipMemcpyHostToDevice);
-
-    auto memcpy_end = std::chrono::high_resolution_clock::now();
-    auto memcpy_duration = std::chrono::duration_cast<std::chrono::microseconds>(memcpy_end - memcpy_start);
-    std::cout << "Sequential async memcpy (host to device) completed in: " << memcpy_duration.count() << " microseconds" << std::endl;
+    // Copy data to device
+    copy_all_data_to_device(data, ptrs);
 
     // Create tensor accessors
-    std::cout << "Creating tensor accessors..." << std::endl;
-
-    // Create size and stride arrays
-    int64_t grad_output_sizes[2] = {B, total_D};
-    int64_t grad_output_strides[2] = {total_D, 1};
-    auto grad_output_acc = at::PackedTensorAccessor64<float, 2, at::RestrictPtrTraits>(
-        grad_output_dev, grad_output_sizes, grad_output_strides);
-
-    int64_t dev_weights_size[1] = {static_cast<int64_t>(dev_weights_host.size())};
-    int64_t dev_weights_stride[1] = {1};
-    auto dev_weights_acc = at::PackedTensorAccessor64<float, 1, at::RestrictPtrTraits>(
-        dev_weights_dev, dev_weights_size, dev_weights_stride);
-
-    int64_t uvm_weights_size[1] = {static_cast<int64_t>(uvm_weights_host.size())};
-    int64_t uvm_weights_stride[1] = {1};
-    auto uvm_weights_acc = at::PackedTensorAccessor64<float, 1, at::RestrictPtrTraits>(
-        uvm_weights_dev, uvm_weights_size, uvm_weights_stride);
-
-    int64_t lxu_cache_sizes[2] = {cache_size, max_D};
-    int64_t lxu_cache_strides[2] = {max_D, 1};
-    auto lxu_cache_weights_acc = at::PackedTensorAccessor64<float, 2, at::RestrictPtrTraits>(
-        lxu_cache_weights_dev, lxu_cache_sizes, lxu_cache_strides);
-
-    int32_t weights_placements_size[1] = {T};
-    int32_t weights_placements_stride[1] = {1};
-    auto weights_placements_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        weights_placements_dev, weights_placements_size, weights_placements_stride);
-
-    int32_t weights_offsets_size[1] = {T};
-    int32_t weights_offsets_stride[1] = {1};
-    auto weights_offsets_acc = at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits>(
-        weights_offsets_dev, weights_offsets_size, weights_offsets_stride);
-
-    int32_t D_offsets_size[1] = {T};
-    int32_t D_offsets_stride[1] = {1};
-    auto D_offsets_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        D_offsets_dev, D_offsets_size, D_offsets_stride);
-
-    int32_t hash_size_cumsum_size[1] = {T};
-    int32_t hash_size_cumsum_stride[1] = {1};
-    auto hash_size_cumsum_acc = at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits>(
-        hash_size_cumsum_dev, hash_size_cumsum_size, hash_size_cumsum_stride);
-    int32_t sorted_linear_indices_run_size[1] = {num_indices};
-    int32_t sorted_linear_indices_run_stride[1] = {1};
-    auto sorted_linear_indices_run_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        sorted_linear_indices_run_dev, sorted_linear_indices_run_size, sorted_linear_indices_run_stride);
-
-    int32_t sorted_linear_indices_cumulative_run_lengths_size[1] = {num_indices};
-    int32_t sorted_linear_indices_cumulative_run_lengths_stride[1] = {1};
-    auto sorted_linear_indices_cumulative_run_lengths_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        sorted_linear_indices_cumulative_run_lengths_dev, sorted_linear_indices_cumulative_run_lengths_size, sorted_linear_indices_cumulative_run_lengths_stride);
-
-    int32_t long_run_ids_size[1] = {num_indices};
-    int32_t long_run_ids_stride[1] = {1};
-    auto long_run_ids_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        long_run_ids_dev, long_run_ids_size, long_run_ids_stride);
-
-    int32_t num_long_run_ids_size[1] = {1};
-    int32_t num_long_run_ids_stride[1] = {1};
-    auto num_long_run_ids_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        num_long_run_ids_dev, num_long_run_ids_size, num_long_run_ids_stride);
-
-    int32_t sorted_infos_size[1] = {num_indices};
-    int32_t sorted_infos_stride[1] = {1};
-    auto sorted_infos_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        sorted_infos_dev, sorted_infos_size, sorted_infos_stride);
-
-    int32_t sorted_lxu_cache_locations_size[1] = {num_indices};
-    int32_t sorted_lxu_cache_locations_stride[1] = {1};
-    auto sorted_lxu_cache_locations_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        sorted_lxu_cache_locations_dev, sorted_lxu_cache_locations_size, sorted_lxu_cache_locations_stride);
-
-    int32_t table_unique_indices_offsets_size[1] = {T};
-    int32_t table_unique_indices_offsets_stride[1] = {1};
-    auto table_unique_indices_offsets_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        table_unique_indices_offsets_dev, table_unique_indices_offsets_size, table_unique_indices_offsets_stride);
-
-    int32_t long_run_id_to_really_long_run_ids_size[1] = {num_indices};
-    int32_t long_run_id_to_really_long_run_ids_stride[1] = {1};
-    auto long_run_id_to_really_long_run_ids_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        long_run_id_to_really_long_run_ids_dev, long_run_id_to_really_long_run_ids_size, long_run_id_to_really_long_run_ids_stride);
-    int32_t temp_grad_accum_sizes[2] = {B, total_D};
-    int32_t temp_grad_accum_strides[2] = {total_D, 1};
-    auto temp_grad_accum_acc = at::PackedTensorAccessor32<float, 2, at::RestrictPtrTraits>(
-        temp_grad_accum_dev, temp_grad_accum_sizes, temp_grad_accum_strides);
-
-    int32_t grad_accum_counter_sizes[1] = {1};
-    int32_t grad_accum_counter_strides[1] = {1};
-    auto grad_accum_counter_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        grad_accum_counter_dev, grad_accum_counter_sizes, grad_accum_counter_strides);
-    int64_t momentum1_dev_sizes[1] = {static_cast<int64_t>(momentum1_dev_host.size())};
-    int64_t momentum1_dev_strides[1] = {1};
-    auto momentum1_dev_acc = at::PackedTensorAccessor64<float, 1, at::RestrictPtrTraits>(
-        momentum1_dev_dev, momentum1_dev_sizes, momentum1_dev_strides);
-
-    int64_t momentum1_uvm_sizes[1] = {static_cast<int64_t>(momentum1_uvm_host.size())};
-    int64_t momentum1_uvm_strides[1] = {1};
-    auto momentum1_uvm_acc = at::PackedTensorAccessor64<float, 1, at::RestrictPtrTraits>(
-        momentum1_uvm_dev, momentum1_uvm_sizes, momentum1_uvm_strides);
-    int32_t momentum1_placements_sizes[1] = {T};
-    int32_t momentum1_placements_strides[1] = {1};
-    auto momentum1_placements_acc = at::PackedTensorAccessor32<int32_t, 1, at::RestrictPtrTraits>(
-        momentum1_placements_dev, momentum1_placements_sizes, momentum1_placements_strides);
-
-    int32_t momentum1_offsets_sizes[1] = {T};
-    int32_t momentum1_offsets_strides[1] = {1};
-    auto momentum1_offsets_acc = at::PackedTensorAccessor32<int64_t, 1, at::RestrictPtrTraits>(
-        momentum1_offsets_dev, momentum1_offsets_sizes, momentum1_offsets_strides);
-
-    // Kernel parameters
-    const bool use_uniq_cache_locations = false;
-    const bool stochastic_rounding = false;
-    const at::PhiloxCudaState stochastic_rounding_philox_args(0ULL, 0ULL);
-    const int32_t info_B_num_bits = 20;
-    const uint32_t info_B_mask = (1U << info_B_num_bits) - 1;
-    const int32_t max_segment_length_per_cta = 32;
-    const bool use_deterministic_algorithms = false;
-    const int32_t max_vecs_per_thread = 2;
-    const float learning_rate = 0.01f;
-    const float eps = 1e-8f;
-    const float weight_decay = 0.0f;
-    const int64_t weight_decay_mode = 0;
-    const float max_norm = 0.0f;
+    auto accs = create_all_tensor_accessors(data, ptrs);
 
     // Launch kernel
-    std::cout << "Launching kernel on AMD GPU..." << std::endl;
+    std::cout << "Launching grad indice weights kernel with captured data..." << std::endl;
 
-    dim3 blockDim(64, 4, 1);   // workgroupx=64, workgroupy=4, workgroupz=1
-    dim3 gridDim(16384, 1, 1); // gridx=16384, gridy=1, gridz=1
+    dim3 blockDim(64, 4, 1);
+    dim3 gridDim(16384, 1, 1);
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    // Call the kernel with template parameters: float, float, float, int32_t, 2, 64, true
-    split_embedding_backward_codegen_rowwise_adagrad_unweighted_kernel_cta_per_row_1<float, float, float, int32_t, 2, 64, true>
+    // Call the grad indice weights kernel with captured data
+    split_embedding_codegen_grad_indice_weights_kernel<float, float, float, int64_t, 2, 64, true>
         <<<gridDim, blockDim>>>(
-            grad_output_acc,
-            dev_weights_acc,
-            uvm_weights_acc,
-            lxu_cache_weights_acc,
-            weights_placements_acc,
-            weights_offsets_acc,
-            D_offsets_acc,
-            hash_size_cumsum_acc,
-            sorted_linear_indices_run_acc,
-            sorted_linear_indices_cumulative_run_lengths_acc,
-            long_run_ids_acc,
-            num_long_run_ids_acc,
-            sorted_infos_acc,
-            sorted_lxu_cache_locations_acc,
-            use_uniq_cache_locations,
-            table_unique_indices_offsets_acc,
-            stochastic_rounding,
-            stochastic_rounding_philox_args,
-            info_B_num_bits,
-            info_B_mask,
-            long_run_id_to_really_long_run_ids_acc,
-            temp_grad_accum_acc,
-            grad_accum_counter_acc,
-            max_segment_length_per_cta,
-            use_deterministic_algorithms,
-            max_vecs_per_thread,
-            momentum1_dev_acc,
-            momentum1_uvm_acc,
-            momentum1_placements_acc,
-            momentum1_offsets_acc,
-            learning_rate,
-            eps,
-            weight_decay,
-            weight_decay_mode,
-            max_norm);
+            accs.grad_output_acc,
+            accs.dev_weights_acc,
+            accs.uvm_weights_acc,
+            accs.lxu_cache_weights_acc,
+            accs.weights_placements_acc,
+            accs.weights_offsets_acc,
+            accs.D_offsets_acc,
+            accs.indices_acc,
+            accs.offsets_acc,
+            accs.lxu_cache_locations_acc,
+            accs.feature_requires_grad_acc,
+            accs.grad_indice_weights_acc,
+            fbgemm_gpu::FixedDivisor(data.B));
 
     HIP_CHECK(hipDeviceSynchronize());
 
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
 
-    std::cout << "Kernel execution completed successfully on AMD GPU!" << std::endl;
+    std::cout << "Grad indice weights kernel execution completed successfully!" << std::endl;
     std::cout << "Execution time: " << duration.count() << " microseconds" << std::endl;
 
-    // Copy results back to host for verification (parallel version)
-    std::cout << "Copying results back to host..." << std::endl;
+    // Copy results back to host
+    std::vector<float> grad_indice_weights_host(data.indices.size());
+    copy_from_device(grad_indice_weights_host, ptrs.grad_indice_weights_dev);
 
-    auto memcpy_back_start = std::chrono::high_resolution_clock::now();
+    // Print sample results
+    print_sample_data(grad_indice_weights_host, "grad_indice_weights", 10);
 
-    std::vector<std::pair<void*, const void*>> memcpy_back_ops;
-    std::vector<size_t> back_sizes;
+    // Save results to file
+    save_results_to_file(capture_dir, grad_indice_weights_host);
 
-    memcpy_back_ops.emplace_back(dev_weights_host.data(), dev_weights_dev);
-    back_sizes.push_back(dev_weights_host.size() * sizeof(float));
+    // Cleanup device memory
+    free_all_device_memory(ptrs);
 
-    memcpy_back_ops.emplace_back(momentum1_dev_host.data(), momentum1_dev_dev);
-    back_sizes.push_back(momentum1_dev_host.size() * sizeof(float));
-
-    // Execute device-to-host memcpy operations sequentially using async calls
-    executeHipMemcpyAsync<int>(memcpy_back_ops, back_sizes, hipMemcpyDeviceToHost);
-
-    auto memcpy_back_end = std::chrono::high_resolution_clock::now();
-    auto memcpy_back_duration = std::chrono::duration_cast<std::chrono::microseconds>(memcpy_back_end - memcpy_back_start);
-    std::cout << "Sequential async memcpy (device to host) completed in: " << memcpy_back_duration.count() << " microseconds" << std::endl;
-
-    // Print some sample results
-    std::cout << "Sample updated weights (first 10 elements):" << std::endl;
-    for (int i = 0; i < std::min(10, static_cast<int>(dev_weights_host.size())); ++i)
-    {
-        std::cout << "  dev_weights[" << i << "] = " << dev_weights_host[i] << std::endl;
-    }
-
-    std::cout << "Sample momentum values (first 10 elements):" << std::endl;
-    for (int i = 0; i < std::min(10, static_cast<int>(momentum1_dev_host.size())); ++i)
-    {
-        std::cout << "  momentum1_dev[" << i << "] = " << momentum1_dev_host[i] << std::endl;
-    }
-
-    // Cleanup
-    std::cout << "Cleaning up..." << std::endl;
-    HIP_CHECK(hipFree(grad_output_dev));
-    HIP_CHECK(hipFree(dev_weights_dev));
-    HIP_CHECK(hipFree(uvm_weights_dev));
-    HIP_CHECK(hipFree(lxu_cache_weights_dev));
-    HIP_CHECK(hipFree(weights_placements_dev));
-    HIP_CHECK(hipFree(weights_offsets_dev));
-    HIP_CHECK(hipFree(D_offsets_dev));
-    HIP_CHECK(hipFree(hash_size_cumsum_dev));
-    HIP_CHECK(hipFree(sorted_linear_indices_run_dev));
-    HIP_CHECK(hipFree(sorted_linear_indices_cumulative_run_lengths_dev));
-    HIP_CHECK(hipFree(long_run_ids_dev));
-    HIP_CHECK(hipFree(num_long_run_ids_dev));
-    HIP_CHECK(hipFree(sorted_infos_dev));
-    HIP_CHECK(hipFree(sorted_lxu_cache_locations_dev));
-    HIP_CHECK(hipFree(table_unique_indices_offsets_dev));
-    HIP_CHECK(hipFree(long_run_id_to_really_long_run_ids_dev));
-    HIP_CHECK(hipFree(temp_grad_accum_dev));
-    HIP_CHECK(hipFree(grad_accum_counter_dev));
-    HIP_CHECK(hipFree(momentum1_dev_dev));
-    HIP_CHECK(hipFree(momentum1_uvm_dev));
-    HIP_CHECK(hipFree(momentum1_placements_dev));
-    HIP_CHECK(hipFree(momentum1_offsets_dev));
-
-    std::cout << "HIP test completed successfully!" << std::endl;
+    std::cout << "Kernel execution with captured data completed successfully!" << std::endl;
+    std::cout << "\nAll tests completed successfully!" << std::endl;
     return 0;
 }

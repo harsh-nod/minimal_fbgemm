@@ -19,7 +19,6 @@
 #include "fbgemm_gpu/embedding_backward_template_helpers.cuh"
 #include "fbgemm_gpu/utils/tensor_accessor_builder.h"
 #include "fbgemm_gpu/split_embeddings_utils.cuh"
-#include "fbgemm_gpu/utils/weight_row.h"
 
 #define GROUP_REDUCE_ALL_SUM(val, ...) \
   warpReduceAllSum<__VA_ARGS__, kThreadGroupSize>(val, shfl_sync_mask)
@@ -114,9 +113,9 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
     }
     [[maybe_unused]] constexpr auto enable_optimizer_offloading = false;
 
-
+    
     at::acc_type<cache_t, true> g_local_sum_square = 0.0;
-
+    
     if constexpr (kUseVecBlocking) {
         // max_vecs is not known at compile time
         for (int32_t vec = 0;
@@ -125,7 +124,7 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
             ++vec) {
             const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
             [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
-
+            
         const float4* grad = &smem_grad_sum[d_vec].acc;
         auto gx = grad->x;
         auto gy = grad->y;
@@ -140,9 +139,9 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
             gw += weight_decay * weight.acc.w;
         }
         g_local_sum_square += gx * gx + gy * gy + gz * gz + gw * gw;
-
+    
         }
-
+    
     } else {
         // kFixedMaxVecsPerThread is known at compile time
         #pragma unroll kFixedMaxVecsPerThread
@@ -152,7 +151,7 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
             ++vec) {
             const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
             [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
-
+            
         const float4* grad = &grad_sum[vec].acc;
         auto gx = grad->x;
         auto gy = grad->y;
@@ -167,10 +166,10 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
             gw += weight_decay * weight.acc.w;
         }
         g_local_sum_square += gx * gx + gy * gy + gz * gz + gw * gw;
-
+    
         }
     }
-
+    	
 	// Define the rowwise adagrad optimizer state struct view
     struct [[maybe_unused]] OptimizerState {
         at::acc_type<cache_t, true> momentum;
@@ -181,17 +180,17 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
 
     at::acc_type<cache_t, true> multiplier = 0.0;
     at::acc_type<cache_t, true> correction = 0.0;
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0) {	
         auto new_sum_square_grads = g_avg_square;
-
-        // Update the optimizer state.  Use optimizer state offloading only if
+	
+        // Update the optimizer state.  Use optimizer state offloading only if 
         // SSD and if enabled by the user
         if (enable_optimizer_offloading) {
             // Fetch the pointer to the optimizer state along the cache row
             auto* optimizer = weight_row_template.template optimizer_state_ptr<OptimizerState>();
             new_sum_square_grads += optimizer->momentum;
             optimizer->momentum = new_sum_square_grads;
-
+        
         } else {
             new_sum_square_grads += momentum1[idx];
             momentum1[idx] = new_sum_square_grads;
@@ -211,11 +210,11 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
     }
     multiplier = SHFL_SYNC(multiplier, 0);
     correction = SHFL_SYNC(correction, 0);
+    
 
-
-
+    
     float2 qparams_new;
-
+    
     if constexpr (kUseVecBlocking) {
         // max_vecs is not known at compile time
         for (int32_t vec = 0;
@@ -224,25 +223,25 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
             ++vec) {
             const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
             [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
-
+            
            Vec4TAcc<cache_t> weight_new = weight_row_template.load(d, qparams_template);
            Vec4TAcc<cache_t>& grad = smem_grad_sum[d_vec];
            weight_new.mul_(global_weight_decay);
-
+           
         weight_new.acc.x = correction * weight_new.acc.x - multiplier * grad.acc.x;
         weight_new.acc.y = correction * weight_new.acc.y - multiplier * grad.acc.y;
         weight_new.acc.z = correction * weight_new.acc.z - multiplier * grad.acc.z;
         weight_new.acc.w = correction * weight_new.acc.w - multiplier * grad.acc.w;
-
+    
            if (kIsInt8 && !cache_weights) {
                shared_weight_update_row[d_vec] = weight_new;
            } else {
                // qparams_new not used if type is not int8
                weight_row_template.store(weight_new, d, qparams_new);
            }
-
+           
         }
-
+    
     } else {
         // kFixedMaxVecsPerThread is known at compile time
         #pragma unroll kFixedMaxVecsPerThread
@@ -252,26 +251,26 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
             ++vec) {
             const int32_t d_vec = vec * kThreadGroupSize + threadIdx.x;
             [[maybe_unused]] const int32_t d = d_vec * VEC_WIDTH;
-
+            
            Vec4TAcc<cache_t> weight_new = weight_row_template.load(d, qparams_template);
            Vec4TAcc<cache_t>& grad = grad_sum[vec];
            weight_new.mul_(global_weight_decay);
-
+           
         weight_new.acc.x = correction * weight_new.acc.x - multiplier * grad.acc.x;
         weight_new.acc.y = correction * weight_new.acc.y - multiplier * grad.acc.y;
         weight_new.acc.z = correction * weight_new.acc.z - multiplier * grad.acc.z;
         weight_new.acc.w = correction * weight_new.acc.w - multiplier * grad.acc.w;
-
+    
            if (kIsInt8 && !cache_weights) {
                shared_weight_update_row[d_vec] = weight_new;
            } else {
                // qparams_new not used if type is not int8
                weight_row_template.store(weight_new, d, qparams_new);
            }
-
+           
         }
     }
-
+    
 
     if constexpr (kIsInt8) {
         if (!cache_weights) {
@@ -295,7 +294,7 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
         }
     }
 
-
+    
     if (max_norm > 0.0) {
         CUDA_KERNEL_ASSERT(!(std::is_same<emb_t, uint8_t>::value && !cache_weights)); // not supported for uint8 yet
 
@@ -335,7 +334,7 @@ DEVICE_INLINE void split_rowwise_adagrad_table_update_kernel(
             }
         }
     }
-
+    
 }
 
 // clang-format on
